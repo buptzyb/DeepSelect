@@ -1,0 +1,163 @@
+ds_tune patch 3/3 against DeepSelect bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18 (https://github.com/deepseek-ai/DeepSelect).
+Rename topk_select_{common,fp32,bf16_normal} to tune_{common,fp32,bf16} so the ds_tune .so can never alias stock deep_select symbols.
+Apply in order from the DeepSelect root: patch -p1 < 000N-*.patch (or git apply).
+
+diff -u a/csrc/cuda_kernels/bit_utils.cuh b/csrc/cuda_kernels/bit_utils.cuh
+--- a/csrc/cuda_kernels/bit_utils.cuh
++++ b/csrc/cuda_kernels/bit_utils.cuh
+@@ -3,7 +3,7 @@
+ #include <cstdint>
+ #include <cuda_bf16.h>
+ 
+-namespace topk_select_common {
++namespace tune_common {
+ 
+ __device__ __forceinline__
+ uint32_t bf16x2_to_u32(const nv_bfloat162 &v) {
+@@ -87,4 +87,4 @@
+     }
+ }
+ 
+-} // namespace topk_select_common
++} // namespace tune_common
+diff -u a/csrc/cuda_kernels/common_parts.cuh b/csrc/cuda_kernels/common_parts.cuh
+--- a/csrc/cuda_kernels/common_parts.cuh
++++ b/csrc/cuda_kernels/common_parts.cuh
+@@ -13,7 +13,7 @@
+ 
+ using transac_bar_t = kerutils::transac_bar_t;
+ 
+-namespace topk_select_common {
++namespace tune_common {
+ 
+ #ifdef KERUTILS_ENABLE_SM100
+     #define IS_LDG_STG_256_AVAILABLE 1
+@@ -1519,4 +1519,4 @@
+     }
+ };
+ 
+-} // namespace topk_select_common
++} // namespace tune_common
+diff -u a/csrc/cuda_kernels/v3/topk_select.cuh b/csrc/cuda_kernels/v3/topk_select.cuh
+--- a/csrc/cuda_kernels/v3/topk_select.cuh
++++ b/csrc/cuda_kernels/v3/topk_select.cuh
+@@ -18,11 +18,11 @@
+ #include "cuda_kernels/utils.cuh"
+ #include "cuda_kernels/common_parts.cuh"
+ 
+-namespace topk_select_bf16_normal {
++namespace tune_bf16 {
+ 
+ template<typename Config>
+-class TopkSelectKernelBF16Normal : public topk_select_common::TopkSelectKernelBF16Base<Config> {
+-    using BF16Base = topk_select_common::TopkSelectKernelBF16Base<Config>;
++class TopkSelectKernelBF16Normal : public tune_common::TopkSelectKernelBF16Base<Config> {
++    using BF16Base = tune_common::TopkSelectKernelBF16Base<Config>;
+ public:
+     using ValueT = typename BF16Base::ValueT;
+     using OutIdxT = typename BF16Base::OutIdxT;
+@@ -147,4 +147,4 @@
+     }, kernel, args, tma_params);
+ }
+ 
+-}   // topk_select_bf16_normal
++}   // tune_bf16
+diff -u a/csrc/cuda_kernels/v3/topk_select.h b/csrc/cuda_kernels/v3/topk_select.h
+--- a/csrc/cuda_kernels/v3/topk_select.h
++++ b/csrc/cuda_kernels/v3/topk_select.h
+@@ -5,9 +5,9 @@
+ 
+ #include "structs.h"
+ 
+-namespace topk_select_bf16_normal {
++namespace tune_bf16 {
+ 
+ template<typename Config>
+ void run_topk_select_kernel(const TopkSelectArgs &args);
+ 
+-}   // topk_select_bf16_normal
++}   // tune_bf16
+diff -u a/csrc/cuda_kernels/v3_fp32/topk_select.cuh b/csrc/cuda_kernels/v3_fp32/topk_select.cuh
+--- a/csrc/cuda_kernels/v3_fp32/topk_select.cuh
++++ b/csrc/cuda_kernels/v3_fp32/topk_select.cuh
+@@ -18,11 +18,11 @@
+ #include "cuda_kernels/utils.cuh"
+ #include "cuda_kernels/common_parts.cuh"
+ 
+-namespace topk_select_fp32 {
++namespace tune_fp32 {
+ 
+ template<typename Config>
+-class TopkSelectKernelFP32 : public topk_select_common::TopkSelectKernelBase<Config> {
+-    using Base = topk_select_common::TopkSelectKernelBase<Config>;
++class TopkSelectKernelFP32 : public tune_common::TopkSelectKernelBase<Config> {
++    using Base = tune_common::TopkSelectKernelBase<Config>;
+ public:
+     using ValueT = typename Base::ValueT;
+     using OutIdxT = typename Base::OutIdxT;
+@@ -127,7 +127,7 @@
+             uint32_t addr;
+             asm volatile ("mad.lo.u32 %0, %1, 4, %2; red.shared.add.u32 [%0], 1;"
+                           : "=r"(addr)
+-                          : "r"(topk_select_common::distort(value_bits) >> 24), "r"(hist_base)
++                          : "r"(tune_common::distort(value_bits) >> 24), "r"(hist_base)
+                           : "memory");
+         };
+         auto histogram_radix_msb = [&]<uint32_t N>(const uint32_t (&vals)[N], uint32_t m_end) {
+@@ -263,7 +263,7 @@
+                 for (uint32_t i = 0; i < NUM_128b_PER_THREAD; i++) {
+                     if (i == num_my_128b) break;
+                     uint32_t pair2[4];
+-                    topk_select_common::ld_shared<4>(pair2, (const uint32_t*)b128_to_pair_addr(b128_base + i));
++                    tune_common::ld_shared<4>(pair2, (const uint32_t*)b128_to_pair_addr(b128_base + i));
+                     fn(pair2[1]);
+                     fn(pair2[3]);
+                 }
+@@ -285,7 +285,7 @@
+                 for (uint32_t i = 0; i < NUM_128b_PER_THREAD; i++) {
+                     if (i == num_my_128b) break;
+                     uint32_t pair2[4];
+-                    topk_select_common::ld_shared<4>(pair2, (const uint32_t*)b128_to_pair_addr(b128_base + i));
++                    tune_common::ld_shared<4>(pair2, (const uint32_t*)b128_to_pair_addr(b128_base + i));
+                     float v0 = __uint_as_float(pair2[1]);
+                     float v1 = __uint_as_float(pair2[3]);
+                     bool t0 = v0 == pivot_value && eq_quota != 0;
+@@ -359,7 +359,7 @@
+                 for (uint32_t k = 0; k < NUM_128b_PER_THREAD_PER_ROUND; ++k) {
+                     uint32_t u = threadIdx.x + (i * NUM_128b_PER_THREAD_PER_ROUND + k) * NUM_THREADS;
+                     if (u < num_128b_in_init_window_padded) {
+-                        topk_select_common::ld_shared<4>(my_values + k * 4, (const uint32_t*)(init_buf + Base::sw_b128(u) * NUM_ELEMS_PER_128b));
++                        tune_common::ld_shared<4>(my_values + k * 4, (const uint32_t*)(init_buf + Base::sw_b128(u) * NUM_ELEMS_PER_128b));
+                         num_my_values = 4 * (k + 1);
+                     }
+                 }
+@@ -371,7 +371,7 @@
+             for (uint32_t j = 0; j < NUM_128b_INIT_PER_THREAD; ++j) {
+                 if (j * NUM_UINT32_PER_128b == num_my_elems) break;
+                 uint32_t u0 = my_elem_start_idx / NUM_ELEMS_PER_128b + j;
+-                topk_select_common::ld_shared<4>(init_values + j * NUM_UINT32_PER_128b, (const uint32_t*)(init_buf + Base::sw_b128(u0) * NUM_ELEMS_PER_128b));
++                tune_common::ld_shared<4>(init_values + j * NUM_UINT32_PER_128b, (const uint32_t*)(init_buf + Base::sw_b128(u0) * NUM_ELEMS_PER_128b));
+             }
+ 
+             __syncthreads();    // publish the round-1 histogram; also the last read of init_buf
+@@ -601,4 +601,4 @@
+     }, kernel, args, tma_params);
+ }
+ 
+-}   // topk_select_fp32
++}   // tune_fp32
+diff -u a/csrc/cuda_kernels/v3_fp32/topk_select.h b/csrc/cuda_kernels/v3_fp32/topk_select.h
+--- a/csrc/cuda_kernels/v3_fp32/topk_select.h
++++ b/csrc/cuda_kernels/v3_fp32/topk_select.h
+@@ -5,9 +5,9 @@
+ 
+ #include "structs.h"
+ 
+-namespace topk_select_fp32 {
++namespace tune_fp32 {
+ 
+ template<typename Config>
+ void run_topk_select_kernel(const TopkSelectArgs &args);
+ 
+-}   // topk_select_fp32
++}   // tune_fp32

@@ -1,0 +1,88 @@
+// ds_tune host entry: same argument checks/TopkSelectArgs layout as DeepSelect csrc/api.cpp,
+// but the kernel config is picked explicitly by id (see configs.json), int32 indices,
+// return_value=True, sorted_value=False.
+#include <cstdlib>
+#include <format>
+#include <limits>
+#include <utility>
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#include "structs.h"
+#include "kerutils/supplemental/torch_tensors.h"
+#include "cuda_kernels/config.h"
+#include "cuda_kernels/v3/topk_select.h"
+#include "cuda_kernels/v3_fp32/topk_select.h"
+
+void topk_cfg(
+    torch::Tensor &input,
+    int topk,
+    torch::Tensor &end,
+    torch::Tensor &output_value,
+    torch::Tensor &output_index,
+    int cfg_id,
+    bool sorted_index,
+    int idx_oob_fill_value,
+    double value_oob_fill_value,
+    bool abort_when_nan_found
+) {
+    int64_t batch_size = input.size(0);
+    int64_t vocab_size = input.size(1);
+    TORCH_CHECK(cfg_id >= 0 && cfg_id < @@NUM_CFG@@, "bad cfg_id");
+    static const bool CFG_IS_FP32[] = {@@FP32FLAGS@@};
+    static const int CFG_MAX_TOPK[] = {@@MAXTOPK@@};
+    TORCH_CHECK(topk > 0 && topk <= CFG_MAX_TOPK[cfg_id],
+                std::format("topk must be in [1, {}] for cfg_id {}", CFG_MAX_TOPK[cfg_id], cfg_id));
+    TORCH_CHECK((input.scalar_type() == at::kFloat) == CFG_IS_FP32[cfg_id], "input dtype does not match cfg dtype");
+    TORCH_CHECK(output_index.scalar_type() == at::kInt, "int32 indices only");
+    TORCH_CHECK(input.scalar_type() == at::kFloat || input.scalar_type() == at::kBFloat16);
+    TORCH_CHECK((uint32_t)vocab_size < MAX_VOCAB_SIZE, "vocab_size must be < 2^23");
+    KU_CHECK_DEVICE(input);
+    KU_CHECK_DEVICE(end);
+    KU_CHECK_DEVICE(output_value);
+    KU_CHECK_DEVICE(output_index);
+    KU_CHECK_SHAPE(end, batch_size);
+    KU_CHECK_SHAPE(output_value, batch_size, topk);
+    KU_CHECK_SHAPE(output_index, batch_size, topk);
+    KU_CHECK_DTYPE(end, at::kInt);
+    KU_CHECK_DTYPE(output_value, input.scalar_type());
+    KU_CHECK_LAST_DIM_CONTIGUOUS(input);
+    KU_CHECK_CONTIGUOUS(end);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(output_value);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(output_index);
+    auto check_dim0_stride = [&](const char *name, torch::Tensor &t, uint32_t align) {
+        TORCH_CHECK((uint64_t)t.stride(0) * t.dtype().itemsize() % align == 0,
+                    std::format("{}.stride(0) must be a multiple of {} bytes", name, align));
+    };
+    check_dim0_stride("input", input, INPUT_STRIDE_ALIGNMENT_REQUIREMENT);
+    check_dim0_stride("output_index", output_index, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT);
+    check_dim0_stride("output_value", output_value, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT);
+
+    TopkSelectArgs args = {
+        (uint32_t)batch_size, (uint32_t)vocab_size, (uint32_t)topk,
+        input.data_ptr(), output_value.data_ptr(), output_index.data_ptr(),
+        nullptr, end.data_ptr<int>(), nullptr,
+        (uint64_t)input.stride(0), (uint64_t)output_value.stride(0), (uint64_t)output_index.stride(0),
+        false, sorted_index, true,
+        idx_oob_fill_value, (float)value_oob_fill_value, abort_when_nan_found
+    };
+    cudaDeviceProp *device_prop = at::cuda::getDeviceProperties(at::cuda::current_device());
+    args.shared_memory_size_per_sm = device_prop->sharedMemPerBlockOptin;
+    args.stream = at::cuda::getCurrentCUDAStream().stream();
+
+    int case_id = cfg_id * 2 + (sorted_index ? 1 : 0);
+    switch (case_id) {
+@@CASES@@
+        default: TORCH_CHECK(false, "unreachable");
+    }
+}
+
+std::pair<uint32_t, uint32_t> get_alignment_requirement() {
+    return {INPUT_STRIDE_ALIGNMENT_REQUIREMENT, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("topk_cfg", &topk_cfg);
+    m.def("get_alignment_requirement", &get_alignment_requirement);
+}

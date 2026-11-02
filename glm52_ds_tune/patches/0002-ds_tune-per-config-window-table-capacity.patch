@@ -1,0 +1,45 @@
+ds_tune patch 2/3 against DeepSelect bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18 (https://github.com/deepseek-ai/DeepSelect).
+Replace the compile-time 'window delta table holds 2^23/512 windows' static_assert by a per-config capacity constant (still >= 2^21 columns) plus a host-side vocab_size check, so B2 + B < 8192 configs (B2 = 2048 tier, bf16 occupancy 2) compile.
+Apply in order from the DeepSelect root: patch -p1 < 000N-*.patch (or git apply).
+
+diff -u a/csrc/cuda_kernels/common_parts.cuh b/csrc/cuda_kernels/common_parts.cuh
+--- a/csrc/cuda_kernels/common_parts.cuh
++++ b/csrc/cuda_kernels/common_parts.cuh
+@@ -378,8 +378,13 @@
+ 
+     static_assert(NUM_EXTRA_SLOTS * sizeof(uint64_t) >= NUM_ELEMS_IN_INIT_WINDOW * sizeof(ValueT),
+                 "the init window must fit in the extra pairs region");
+-    static_assert(NUM_EXTRA_SLOTS * sizeof(uint64_t) / sizeof(uint32_t) >= MAX_VOCAB_SIZE / NUM_ELEMS_PER_SEG,
+-                "the index sort's window delta table must fit in the extra pairs region");
++    // [ds_tune patch 2] per-config capacity of the sorted-index window delta table, checked on the host.
++    static constexpr uint64_t WINDOW_DELTA_CAPACITY_COLS =
++        (uint64_t)(NUM_EXTRA_SLOTS * sizeof(uint64_t) / sizeof(uint32_t)) * NUM_ELEMS_PER_SEG;
++    static constexpr uint32_t MAX_VOCAB_THIS_CFG =
++        WINDOW_DELTA_CAPACITY_COLS < MAX_VOCAB_SIZE ? (uint32_t)WINDOW_DELTA_CAPACITY_COLS : MAX_VOCAB_SIZE;
++    static_assert(MAX_VOCAB_THIS_CFG >= (1u << 21),
++                "the index sort's window delta table must hold at least 2^21 columns");
+     // array `incoming_topk_pairs` will be used as 
+     //     1. tma buffer during init phase
+     //     2. extra array during main phase
+diff -u a/csrc/cuda_kernels/v3/topk_select.cuh b/csrc/cuda_kernels/v3/topk_select.cuh
+--- a/csrc/cuda_kernels/v3/topk_select.cuh
++++ b/csrc/cuda_kernels/v3/topk_select.cuh
+@@ -128,6 +128,7 @@
+ 
+     using Kernel = TopkSelectKernelBF16Normal<Config>;
+     KU_ASSERT(args.topk <= Kernel::MAX_TOPK, "topk is too large. Maximum allowed: %d\n", Kernel::MAX_TOPK);
++    KU_ASSERT(args.vocab_size <= Kernel::MAX_VOCAB_THIS_CFG, "vocab_size exceeds this config's window table");  // [ds_tune patch 2]
+     static_assert(INPUT_STRIDE_ALIGNMENT_REQUIREMENT % 16 == 0);
+ 
+     auto kernel = topk_kernel<Kernel>;
+diff -u a/csrc/cuda_kernels/v3_fp32/topk_select.cuh b/csrc/cuda_kernels/v3_fp32/topk_select.cuh
+--- a/csrc/cuda_kernels/v3_fp32/topk_select.cuh
++++ b/csrc/cuda_kernels/v3_fp32/topk_select.cuh
+@@ -582,6 +582,7 @@
+ 
+     using Kernel = TopkSelectKernelFP32<Config>;
+     KU_ASSERT(args.topk <= Kernel::MAX_TOPK, "topk is too large. Maximum allowed: %d\n", Kernel::MAX_TOPK);
++    KU_ASSERT(args.vocab_size <= Kernel::MAX_VOCAB_THIS_CFG, "vocab_size exceeds this config's window table");  // [ds_tune patch 2]
+     static_assert(INPUT_STRIDE_ALIGNMENT_REQUIREMENT % 16 == 0);
+ 
+     auto kernel = topk_kernel<Kernel>;
